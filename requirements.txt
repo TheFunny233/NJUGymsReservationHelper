@@ -1,0 +1,5 @@
+ddddocr==1.5.6
+pycryptodome==3.21.0
+Requests==2.32.3
+schedule==1.2.2
+selenium==4.27.1

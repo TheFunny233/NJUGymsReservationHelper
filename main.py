@@ -3,6 +3,7 @@ import hashlib
 import time
 import json
 import uuid
+import schedule
 
 import requests
 import ddddocr
@@ -38,7 +39,6 @@ def get_sign(path, params, timestamp):
     md5 = hashlib.md5()
     md5.update(raw_str.encode('utf-8'))
     return md5.hexdigest()
-
 
 def login(url, username, password):
     """
@@ -148,7 +148,6 @@ def login(url, username, password):
     finally:
         driver.quit()
 
-
 def aes_encrypt_string(secret_key, text):
     """
     AES ECB模式加密字符串并进行Base64编码
@@ -192,7 +191,7 @@ def get_blockPuzzle(session):
     jigsawImage = base64.b64decode(resp_json["data"]["repData"]["jigsawImageBase64"])
     originalImage = base64.b64decode(resp_json["data"]["repData"]["originalImageBase64"])
     secret_key = resp_json["data"]["repData"]["secretKey"]
-    token = resp_json["data"]["repData"]["token"]
+    captchaToken = resp_json["data"]["repData"]["token"]
 
     # jigsawImage = base64.b64decode(jigsawImageBase64)
     # originalImage = base64.b64decode(originalImageBase64)
@@ -209,7 +208,7 @@ def get_blockPuzzle(session):
 
     params = {
         "pointJson" : pointJson,
-        "token" : token
+        "token": captchaToken
     }
 
     #检查是否正确，但是实际好像没有什么用
@@ -224,7 +223,7 @@ def get_blockPuzzle(session):
         return get_blockPuzzle(session)
 
     #submit 时需要的参数captchaVerification
-    plain_text = f"{token}---{json.dumps(pos, separators=(',', ':'))}"
+    plain_text = f"{captchaToken}---{json.dumps(pos, separators=(',', ':'))}"
     captcha_verification = aes_encrypt_string(secret_key, plain_text)
 
     return captcha_verification
@@ -277,8 +276,13 @@ def submit_and_pay(session, site_id, date, reservationOrderJson, buddyIds, token
             "Origin" : "https://ggtypt.nju.edu.cn"
         })
         print("正在发送预约请求...")
+        time.sleep(
+            2)  # 呢喃大手，实测1.5-1.6偶然可以约上，所有估计就是1.6s足够，保守起见这里设置成2s{'code': 250, 'message': '预约步骤流程耗时异常，订单提交失败', 'data': None}
         resp = session.post(url, data=params, verify=False)
         print(f"响应状态码: {resp.status_code}")
+        if resp.status_code == 200:
+            # 请求速度太快被gank了，那就再试一次
+            return submit_and_pay(session, site_id, date, reservationOrderJson, buddyIds, token)
         print(resp.json())
         venueTradeNo = resp.json()["data"]["orderInfo"]["tradeNo"]
     except Exception as e:
@@ -296,6 +300,8 @@ def submit_and_pay(session, site_id, date, reservationOrderJson, buddyIds, token
         resp = session.post(pay_url, data=params, verify=False)
         print(f"响应状态码: {resp.status_code}")
         print(resp.json())
+
+
     except Exception as e:
         print(f"支付失败: {e}")
 
@@ -369,7 +375,6 @@ def get_all_gyms(session):
         print(f"请求失败: {e}")
         return None
 
-
 def parse_gym_info(gym_info):
     """
     解析场馆信息并让用户选择场馆和项目
@@ -404,10 +409,11 @@ def parse_gym_info(gym_info):
     project_choice = input("请输入想预约的项目ID：")
     return project_choice
 
-def parse_project_info(project_info):
+
+def parse_site_info(project_info):
     print("\n=== 解析项目场地信息 ===")
     project_info = project_info["data"]
-    token = project_info["token"]
+    reservationToken = project_info["token"]
     reservationStatues = {
         0: "",
         1: "空闲",
@@ -446,8 +452,7 @@ def parse_project_info(project_info):
     print("你选择的预约信息为：")
     print(reservationOrderJson)
 
-    return token, reservationOrderJson
-
+    return reservationToken, reservationOrderJson
 
 def parse_reservation_info(reservation_info):
     print("\n=== 解析预约信息和同伴详情 ===")
@@ -472,8 +477,6 @@ def parse_reservation_info(reservation_info):
     else:
         print("该项目不需要同伴。")
         return []
-
-
 
 def sort_all_campus_venues_data(session):
     raw_data = get_all_gyms(session)
@@ -525,7 +528,6 @@ def sort_all_campus_venues_data(session):
 
     except Exception as e:
         print(f"发生未知错误: {e}")
-
 
 def print_parsed_gyms_data(json_file= "./parsed_gym_data.json", campus_filter=None):
     """
@@ -625,7 +627,6 @@ def print_parsed_gyms_data(json_file= "./parsed_gym_data.json", campus_filter=No
     except Exception as e:
         print(f"❌ 发生未知错误: {e}")
 
-
 def test_reserve_by_hand(session):
     """
     测试函数尝试各个函数可用性的
@@ -638,30 +639,236 @@ def test_reserve_by_hand(session):
 
     date = time.strftime("%Y-%m-%d", time.localtime())
     project_info = get_site_info(session, project_chosen, date)
-    token,reservationOrderJson =parse_project_info(project_info)
+    token, reservationOrderJson = parse_site_info(project_info)
     reservationInfo = get_reservation_info(session, project_chosen, date, reservationOrderJson, token)
     buddyIds = parse_reservation_info(reservationInfo)
     submit_and_pay(session, project_chosen, date, reservationOrderJson, buddyIds, token)
 
 
-def auto_grab_site(id,priorityTimeList=[],buddyIds=[]):
+def auto_grab_site(session, id, priorityTimeList=[], buddyIds=[], isFlexible=True):
     """
     自动抢场，id是想要抢的场地id
     :param id:
-    :param priorityTimeList: 优先时间段列表，格式["08:00-09:00","09:00-10:00"]
+    :param priorityTimeList: 优先时间段列表，格式为starttime ["08:00","09:00"]，如果为空列表 [] 则表示不指定优先时间段，按系统默认顺序尝试所有时间段
     :param buddyIds: 同伴ID列表，如不需要同伴可传入空列表 []，如果没有指定同伴而项目需要同伴则会随机选择同伴（返回列表的前minBuddyNum个）
+    :param isFlexible: 是否灵活选择时间段，如果为True，则在priorityTimeList中找不到可用时间段时会尝试其他时间段
     """
+    date = time.strftime("%Y-%m-%d", time.localtime())
+    print(f"正在获取 {date} 的场地信息 (ID: {id})...")
+
+    siteInfo = get_site_info(session, id, date)
+    if not siteInfo or siteInfo.get("code") != 200:
+        print("获取场地信息失败，请检查网络或登录状态。")
+        return
+
+    data = siteInfo["data"]
+    token = data["token"]
+    # spaceTimeInfo 结构: [{"id": 83313, "beginTime": "09:00", ...}, ...]
+    time_map = {item["beginTime"]: str(item["id"]) for item in data["spaceTimeInfo"]}
+
+    search_list = []
+
+    # 先加入优先时间段
+    for t in priorityTimeList:
+        nowTime = time.strftime("%H:%M", time.localtime())
+        if t in time_map and t > nowTime:
+            search_list.append(t)
+        else:
+            print(f"提示: 时间段 {t} 在该场地不存在或者已经是过去的时间，已跳过。")
+
+    # 如果灵活模式，将剩余的时间段按顺序加入
+    if isFlexible:
+        all_times = sorted(time_map.keys())
+        for t in all_times:
+            if t not in search_list:
+                search_list.append(t)
+
+    if not search_list:
+        print("错误: 没有可供搜索的时间段。可能是当天全部场次都不能用。")
+        return
+
+    found_space_id = None
+    found_time_id = None
+    found_time_str = None
+
+    # reservationDateSpaceInfo 是一个字典，key是日期，value是场地列表
+    # 场地列表结构见 siteinfo.json
+    day_spaces = data["reservationDateSpaceInfo"].get(date, [])
+
+    print(f"正在搜索可用场地，搜索顺序: {search_list}")
+
+    for t_str in search_list:
+        t_id = time_map[t_str]
+
+        for space in day_spaces:
+            # space 结构中，key 为 timeId，value 为状态对象
+            # 状态对象中 "reservationStatus": 1 表示空闲
+            if t_id in space:
+                status_info = space[t_id]
+                if status_info and status_info.get("reservationStatus") == 1:
+                    found_space_id = str(space["id"])
+                    found_time_id = t_id
+                    found_time_str = t_str
+                    print(f"✅ 成功找到空闲场地! 时间: {t_str}, 场地: {space.get('spaceName')}")
+                    break
+
+        if found_space_id:
+            break
+
+    if not found_space_id:
+        print("❌ 抱歉，未找到符合条件的空闲场地。")
+        return
+
+    reservationOrderJson = json.dumps([{
+        "spaceId": found_space_id,
+        "timeId": found_time_id,
+        "venueSpaceGroupId": None
+    }])
+
+    res_info = get_reservation_info(session, id, date, reservationOrderJson, token, SERVER_KEY)
+    final_buddy_ids = list(buddyIds)  # 复制一份，避免修改默认参数
+
+    if res_info and res_info.get("code") == 200:
+        res_data = res_info["data"]
+        min_buddy_num = res_data["venueInfoBean"].get("buddyNumMin", 0)
+
+        if min_buddy_num > 0:
+            current_count = len(final_buddy_ids)
+            if current_count < min_buddy_num:
+                print(f"⚠️ 该场地至少需要 {min_buddy_num} 名同伴，当前指定 {current_count} 名，正在自动从列表补充...")
+
+                available_buddies = res_data.get("buddyList", [])
+                needed = min_buddy_num - current_count
+
+                pool = [str(b["id"]) for b in available_buddies if str(b["id"]) not in final_buddy_ids]
+
+                if len(pool) < needed:
+                    print(f"❌ 账号常用同伴不足！需要补 {needed} 人，实际可用 {len(pool)} 人。")
+                    return
+
+                final_buddy_ids.extend(pool[:needed])
+                print(f"已自动补充同伴ID: {pool[:needed]}")
+
+    print(f"🚀 开始提交订单... [时间: {found_time_str}]")
+    submit_and_pay(session, id, date, reservationOrderJson, final_buddy_ids, token)
+
+    if SERVER_KEY:
+        url = f"https://sctapi.ftqq.com/{SERVER_KEY}.send"
+        content = f"""### 南京大学体育场馆预约脚本通知
+- 预约日期: {date}
+- 预约时间: {found_time_str}
+- 场地ID: {found_space_id}
+- 同伴ID: {', '.join(final_buddy_ids) if final_buddy_ids else '无同伴'}
+- 预约状态: {'成功' if found_space_id else '失败'}
+- 完成时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
+"""
+        data = {
+            "title": "南京大学体育场馆预约脚本通知",
+            "desp": content
+        }
+        try:
+            resp = requests.post(url, data=data)
+            if resp.status_code == 200:
+                print("✅ 微信通知发送成功！")
+            else:
+                print(f"❌ 微信通知发送失败，状态码: {resp.status_code}")
+        except Exception as e:
+            print(f"❌ 发送微信通知时发生错误: {e}")
 
 
+def sleep_until(target_time_str):
+    """
+    休眠直到指定的目标时间点
+    :param target_time_str: 目标时间字符串，格式 "HH:MM"
+    """
+    now = time.localtime()
+    t_part = time.strptime(target_time_str, "%H:%M:%S")
+    target_time = now.replace(hour=t_part.tm_hour, minute=t_part.tm_min, second=t_part.tm_sec, microsecond=0)
+
+    if now >= target_time:
+        print(f"目标时间 {target_time_str} 已经过，跳过等待。")
+        return
+
+    while True:
+        now = time.localtime()
+        diff = (time.mktime(target_time) - time.mktime(now))
+        if diff <= 0:
+            break
+
+        if diff > 60:
+            print(f"距离目标时间 {target_time_str} 还有 {int(diff)} 秒，休眠30秒...")
+            time.sleep(30)
+        elif diff > 10:
+            print(f"距离目标时间 {target_time_str} 还有 {int(diff)} 秒，休眠5秒...")
+            time.sleep(5)
+        else:
+            time.sleep(0.01)
+
+
+def job(USERNAME, PASSWORD, TARGET_ID, TARGET_BUDDIES, PRIORITY_TIMES, IS_FLEXIBLE, SERVER_KEY):
+    print(f"⏰ 任务启动！当前时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
+
+    url = "https://authserver.nju.edu.cn/authserver/login?service=https://ggtypt.nju.edu.cn/venue/login"
+    session = login(url, USERNAME, PASSWORD)
+    if session:
+        print("✅ 登录成功，躁候8点")
+        sleep_until("08:00:00")
+        auto_grab_site(
+            session,
+            id=TARGET_ID,
+            priorityTimeList=PRIORITY_TIMES,
+            buddyIds=TARGET_BUDDIES,
+            isFlexible=IS_FLEXIBLE)
+
+        print(f"⏰ 任务结束！当前时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
 
 if __name__ == "__main__":
 
-    username = "241880000"
-    password = "password"
-    url = "https://authserver.nju.edu.cn/authserver/login?service=https://ggtypt.nju.edu.cn/venue/login"
-    session = login(url, username, password)
-    if session:
-        test_reserve_by_hand(session)
-    #     parse_gym_data(session)
     # print_parsed_gyms_data(campus_filter="苏州校区")
+    # username = "241880000"
+    # password = "password"
+    # url = "https://authserver.nju.edu.cn/authserver/login?service=https://ggtypt.nju.edu.cn/venue/login"
+    # session = login(url, username, password)
+    # if session:
+    #     auto_grab_site(
+    #         session,
+    #         id=171,
+    #         priorityTimeList=["19:00", "20:00"],
+    #         buddyIds=['114514','20250721'],
+    #         isFlexible=True
+    #     )
+
+    # 打印项目ID:
+    # print_parsed_gyms_data(campus_filter="苏州校区")
+
+    # 更新缓存的所有体育场馆:
+    # USERNAME = "241880000"
+    # PASSWORD = "password"
+    # url = "https://authserver.nju.edu.cn/authserver/login?service=https://ggtypt.nju.edu.cn/venue/login"
+    # session = login(url, USERNAME, PASSWORD)
+    # if session:
+    #     sort_all_campus_venues_data(session)
+
+    # 配置参数
+    USERNAME = "241880000"
+    PASSWORD = "password"
+    TARGET_ID = 171  # 不知道这里的可以调用print_parsed_gyms_data()函数查看，或者直接去看parsed_gym_data.json文件
+    TARGET_BUDDIES = ['114514', '20250721']  # 同伴ID列表，如果不知道同伴的id就传入空列表 []
+    PRIORITY_TIMES = ["19:00", "20:00"]  # 优先预约的时间段的开始时间，如果不指定时间段就传入空列表 []
+    IS_FLEXIBLE = True  # 是否灵活选择时间段，如果为True，则在priorityTimeList中找不到可用时间段时（被占用，未开放等情况）会尝试其他时间段
+    SERVER_KEY = ""  # 如果需要微信通知，请填写 Server 酱的 SCKEY，否则留空字符串 ""
+
+    print("🤖 脚本已启动")
+    print("📅 计划每天 07:58 自动唤醒登录，08:00 准时开抢")
+    print("👉 请不要关闭此窗口，保持电脑唤醒状态...")
+    # 设置每天7:58执行任务
+
+    schedule.every().day.at("07:58").do(
+        job,
+        USERNAME, PASSWORD, TARGET_ID, TARGET_BUDDIES, PRIORITY_TIMES, IS_FLEXIBLE, SERVER_KEY
+    )
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
